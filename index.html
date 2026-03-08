@@ -161,6 +161,9 @@
         @media(min-width:769px){
             .mobile-header,.bottom-nav,.mobile-page,#m-toast,#m-sel-caption{display:none!important;}
         }
+        .brave-warn{background:linear-gradient(135deg,rgba(251,130,0,.13),rgba(251,100,0,.07));border:1px solid rgba(251,130,0,.45);border-radius:12px;padding:11px 13px;margin-top:10px;font-size:.76em;color:#ffb347;line-height:1.55;display:none;}
+        .brave-warn.show{display:block;}
+        .brave-warn strong{color:#ff8c00;}
     </style>
 </head>
 <body>
@@ -210,6 +213,7 @@
         <div class="card-title">🎭 Voice Persona</div>
         <div id="m-persona-container"></div>
         <div id="m-engine-tag" class="engine-tag warn">🟡 Tap Activate above first</div>
+        <div class="brave-warn" id="m-brave-warn">🦁 <strong>Brave Shields detected:</strong> Go to <strong>brave://settings/shields</strong> → Fingerprinting → <strong>Standard</strong>, then reload.</div>
     </div>
     <div class="card" style="margin-bottom:10px;">
         <div class="card-title">🌐 Language</div>
@@ -317,6 +321,7 @@
             <div class="card-title">🎭 Voice Persona</div>
             <div id="d-persona-container"></div>
             <div id="d-engine-tag" class="engine-tag warn">🟡 Click Activate</div>
+            <div class="brave-warn" id="d-brave-warn">🦁 <strong>Brave Shields detected:</strong> Voice list is blocked.<br>Fix: Go to <strong>brave://settings/shields</strong> → set <em>Fingerprinting</em> to <strong>Standard</strong> for this page, then reload.<br>Speech will still work using default voice — only persona selection is limited.</div>
         </div>
         <div class="card">
             <div class="card-title">🌐 Language & Tuning</div>
@@ -518,6 +523,12 @@ function initApp(){
     const isMobile=()=>window.innerWidth<=768;
     const $=id=>document.getElementById(id);
 
+    // Brave browser detection
+    const isBrave=()=>!!(navigator.brave&&typeof navigator.brave.isBrave==='function')||
+        /brave/i.test(navigator.userAgent)||
+        (navigator.userAgentData&&(navigator.userAgentData.brands||[]).some(b=>/brave/i.test(b.brand)));
+    let braveDetected=isBrave();
+
     let pdfDoc=null,currentPage=1,totalPages=0;
     let allVoices=[],activated=false;
     let activePersona=BASE_GROUPS[0].personas[0];
@@ -535,14 +546,20 @@ function initApp(){
     const getLangSample=lang=>LANG_SAMPLES[lang]||LANG_SAMPLES.en;
 
     function pickVoice(persona,lang){
+        if(!allVoices.length)return null;
         const bcp=(LANG_BCP[lang]||lang).toLowerCase();
         const pre=lang.toLowerCase();
-        let pool=allVoices.filter(v=>v.lang.toLowerCase()===bcp);
-        if(!pool.length)pool=allVoices.filter(v=>v.lang.toLowerCase().startsWith(pre));
-        if(!pool.length)pool=allVoices;
+        // Build a pool strictly matched to the selected language
+        let pool=allVoices.filter(v=>(v.lang||'').toLowerCase()===bcp);
+        if(!pool.length)pool=allVoices.filter(v=>(v.lang||'').toLowerCase().startsWith(pre));
+        // CRITICAL: if no voice exists for this language, return null.
+        // Do NOT fall back to allVoices — using a wrong-language voice
+        // (e.g. en-US voice for German text) causes the TTS engine to
+        // mispronounce or spell out words letter-by-letter (d-i-r bug).
         if(!pool.length)return null;
+        // Try persona keyword hints within the language-matched pool only
         for(const k of(persona.kw||[])){
-            const v=pool.find(v=>v.name.toLowerCase().includes(k)||v.lang.toLowerCase().includes(k));
+            const v=pool.find(v=>v.name.toLowerCase().includes(k)||(v.lang||'').toLowerCase().includes(k));
             if(v)return v;
         }
         return pool[(persona.idx||0)%pool.length]||pool[0];
@@ -562,26 +579,45 @@ function initApp(){
     function speakText(text){
         if(!text||!text.trim())return;
         const lang=getLang();
+        // CRITICAL FIX: Always force the selected language BCP47.
+        // Never use voice.lang — an English voice assigned to German text
+        // causes the TTS engine to spell words letter-by-letter (e.g. "dir" → "d-i-r")
+        const forcedLang=LANG_BCP[lang]||lang;
         window.speechSynthesis.cancel();
-        // Chrome needs ~100-150ms after cancel before speaking again
         setTimeout(()=>{
-            // Re-fetch voices on each speak — Chrome loads voices async
-            const freshVoices=window.speechSynthesis.getVoices();
-            if(freshVoices.length>allVoices.length){allVoices=freshVoices;}
-            if(!allVoices.length){allVoices=freshVoices;}
+            // Refresh voice list (Chrome/Brave load async)
+            const fresh=window.speechSynthesis.getVoices();
+            if(fresh.length>allVoices.length)allVoices=fresh;
+            if(!allVoices.length)allVoices=fresh;
+
             const voice=pickVoice(activePersona,lang);
             const u=new SpeechSynthesisUtterance(text);
-            if(voice)u.voice=voice;
-            u.lang  =voice?voice.lang:(LANG_BCP[lang]||'en-US');
+
+            // Always set lang to the SELECTED language — never voice.lang
+            u.lang=forcedLang;
+
+            // Only attach a voice if it actually belongs to the target language.
+            // If wrong-language voice attached, browser may use English phonetics
+            // on foreign text causing gibberish or letter-by-letter spelling.
+            if(voice){
+                const vl=(voice.lang||'').toLowerCase();
+                const tpre=lang.toLowerCase();
+                if(vl===forcedLang.toLowerCase()||vl.startsWith(tpre)){
+                    u.voice=voice; // confirmed same language — safe to use
+                }
+                // else: don't set voice — let browser pick default for forcedLang
+            }
+
             u.rate  =Math.min(1.8,getRate()*activePersona.rate);
             u.pitch =Math.min(2.0,getPitch()*activePersona.pitch);
             u.volume=Math.min(1.0,getVol()*(activePersona.vol||1));
-            // Chrome long-utterance keepalive: pause/resume every 5s prevents cutoff
+
+            // Keepalive pause/resume — skip in Brave (it kills utterances there)
             let kr;
             u.onstart=()=>{
+                if(braveDetected)return;
                 kr=setInterval(()=>{
                     if(!window.speechSynthesis.speaking||window.speechSynthesis.paused){clearInterval(kr);return;}
-                    // Chrome-specific: pause/resume every 5s prevents ~15s cutoff bug
                     window.speechSynthesis.pause();
                     window.speechSynthesis.resume();
                 },5000);
@@ -589,7 +625,6 @@ function initApp(){
             u.onend=()=>{clearInterval(kr);};
             u.onerror=(e)=>{
                 clearInterval(kr);
-                // Chrome throws 'interrupted' on cancel — silently ignore
                 if(e.error==='interrupted'||e.error==='synthesis-unavailable'||e.error==='canceled')return;
                 if(e.error==='not-allowed'){
                     ['d-engine-tag','m-engine-tag'].forEach(id=>{
@@ -717,16 +752,18 @@ function initApp(){
         if(v.length){allVoices=v;buildGrids();updateTag();return true;}
         return false;
     }
-    // Trigger Chrome's async voice load by calling getVoices() immediately (required for Chrome)
+    // Trigger async voice load (Chrome/Brave require initial call)
     window.speechSynthesis.getVoices();
     if(!loadVoices()){
-        // Chrome fires onvoiceschanged once voices are ready
         window.speechSynthesis.onvoiceschanged=()=>{loadVoices();};
-        // Aggressive poll — Chrome sometimes fires onvoiceschanged late or not at all
+        // Poll aggressively — onvoiceschanged may never fire in Brave strict mode
         let vR=0;const vT=setInterval(()=>{
             if(loadVoices()||vR++>60)clearInterval(vT);
         },200);
     }
+    // Brave: voices may only load after a user gesture / focus event
+    window.addEventListener('focus',()=>{if(!allVoices.length)loadVoices();});
+    document.addEventListener('click',()=>{if(!allVoices.length)loadVoices();},{once:true});
 
     function updateTag(){
         const has=allVoices.length>0,act=activated?'✅ Active':'🟡 Not activated';
@@ -802,16 +839,31 @@ function initApp(){
         const w=new SpeechSynthesisUtterance('');w.volume=0;w.rate=2;
         window.speechSynthesis.speak(w);
         activated=true;
-        // Chrome loads voices async after first user-gesture; wait longer then retry
         function afterActivate(attempt){
             allVoices=window.speechSynthesis.getVoices();
-            if(!allVoices.length&&attempt<8){
-                setTimeout(()=>afterActivate(attempt+1),200);return;
+            if(!allVoices.length&&attempt<12){
+                setTimeout(()=>afterActivate(attempt+1),250);return;
             }
             buildGrids();updateTag();
+            if(allVoices.length===0){
+                // Brave with strict fingerprinting shields — voices are blocked
+                braveDetected=true;
+                ['d-brave-warn','m-brave-warn'].forEach(id=>{
+                    const el=document.getElementById(id);if(el)el.classList.add('show');
+                });
+                ['d-engine-tag','m-engine-tag'].forEach(id=>{
+                    const el=document.getElementById(id);
+                    if(el){el.textContent='🦁 Brave Shields blocking voices — speech still works via default';el.className='engine-tag warn';}
+                });
+            } else {
+                ['d-brave-warn','m-brave-warn'].forEach(id=>{
+                    const el=document.getElementById(id);if(el)el.classList.remove('show');
+                });
+            }
+            // Still speak — will use browser default voice with correct lang code
             speakText(getLangSample(getLang()));
         }
-        setTimeout(()=>afterActivate(0),200);
+        setTimeout(()=>afterActivate(0),250);
         setStatus('status','✅ Activated! Upload your PDF.','#0d2b1a','#00e676');
         setStatus('m-status','✅ Voice ready! Go to Reader tab.','#0d2b1a','#00e676');
         const banner=$('m-activate-banner');
@@ -969,24 +1021,16 @@ function initApp(){
     }
 
     function getWordAt(e,span){
-        let node=null,off=0;
-        // Prefer standard caretPositionFromPoint (Chrome 128+, Firefox)
-        if(document.caretPositionFromPoint){
-            const pos=document.caretPositionFromPoint(e.clientX,e.clientY);
-            if(pos&&pos.offsetNode&&pos.offsetNode.nodeType===Node.TEXT_NODE){node=pos.offsetNode;off=pos.offset;}
-        }
-        // Fallback to Chrome legacy caretRangeFromPoint
-        if(!node&&document.caretRangeFromPoint){
+        if(document.caretRangeFromPoint){
             const r=document.caretRangeFromPoint(e.clientX,e.clientY);
-            if(r&&r.startContainer&&r.startContainer.nodeType===Node.TEXT_NODE){node=r.startContainer;off=r.startOffset;}
-        }
-        if(node){
-            const txt=node.textContent;
-            let s=off,end=off;
-            while(s>0&&!/\s/.test(txt[s-1]))s--;
-            while(end<txt.length&&!/\s/.test(txt[end]))end++;
-            const w=txt.slice(s,end).replace(/[^a-zA-Z0-9\u00C0-\u024F\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\u0900-\u097F\uAC00-\uD7AF]/g,'').trim();
-            if(w.length>0)return w;
+            if(r?.startContainer?.nodeType===Node.TEXT_NODE){
+                const txt=r.startContainer.textContent,off=r.startOffset;
+                let s=off,end=off;
+                while(s>0&&!/\s/.test(txt[s-1]))s--;
+                while(end<txt.length&&!/\s/.test(txt[end]))end++;
+                const w=txt.slice(s,end).replace(/[^a-zA-Z0-9\u00C0-\u024F\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\u0900-\u097F\uAC00-\uD7AF]/g,'').trim();
+                if(w.length>0)return w;
+            }
         }
         return span.textContent.trim().split(/\s+/)[0]||span.textContent.trim();
     }
